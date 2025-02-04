@@ -5,6 +5,7 @@
 package sshlib
 
 import (
+	"context"
 	"io"
 	"log"
 	"net"
@@ -32,7 +33,7 @@ type Connect struct {
 	Stderr io.Writer
 
 	// ProxyDialer
-	ProxyDialer proxy.Dialer
+	ProxyDialer proxy.ContextDialer
 
 	// Connect timeout second.
 	ConnectTimeout int
@@ -48,6 +49,9 @@ type Connect struct {
 	// Forward ssh agent flag.
 	// Set it before CraeteClient.
 	ForwardAgent bool
+
+	// Set the TTY to be used as the input and output for the Session/Cmd.
+	PtyRelayTty *os.File
 
 	// CheckKnownHosts if true, check knownhosts.
 	// Ignored if HostKeyCallback is set.
@@ -116,15 +120,15 @@ func (c *Connect) CreateClient(host, port, user string, authMethods []ssh.AuthMe
 	uri := net.JoinHostPort(host, port)
 
 	timeout := 20
-	if c.ConnectTimeout > 0 {
-		timeout = c.ConnectTimeout
+	if c.ConnectTimeout == 0 {
+		c.ConnectTimeout = timeout
 	}
 
 	// Create new ssh.ClientConfig{}
 	config := &ssh.ClientConfig{
 		User:    user,
 		Auth:    authMethods,
-		Timeout: time.Duration(timeout) * time.Second,
+		Timeout: time.Duration(c.ConnectTimeout) * time.Second,
 	}
 
 	if c.HostKeyCallback != nil {
@@ -146,17 +150,26 @@ func (c *Connect) CreateClient(host, port, user string, authMethods []ssh.AuthMe
 		c.ProxyDialer = proxy.Direct
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(c.ConnectTimeout)*time.Second)
+	defer cancel()
+
 	// Dial to host:port
-	netConn, err := c.ProxyDialer.Dial("tcp", uri)
-	if err != nil {
-		return
+	netConn, cerr := c.ProxyDialer.DialContext(ctx, "tcp", uri)
+	if cerr != nil {
+		return cerr
 	}
 
+	// Set deadline
+	netConn.SetDeadline(time.Now().Add(time.Duration(c.ConnectTimeout) * time.Second))
+
 	// Create new ssh connect
-	sshCon, channel, req, err := ssh.NewClientConn(netConn, uri, config)
-	if err != nil {
-		return
+	sshCon, channel, req, cerr := ssh.NewClientConn(netConn, uri, config)
+	if cerr != nil {
+		return cerr
 	}
+
+	// Reet deadline
+	netConn.SetDeadline(time.Time{})
 
 	// Create *ssh.Client
 	c.Client = ssh.NewClient(sshCon, channel, req)
@@ -168,7 +181,6 @@ func (c *Connect) CreateClient(host, port, user string, authMethods []ssh.AuthMe
 func (c *Connect) CreateSession() (session *ssh.Session, err error) {
 	// Create session
 	session, err = c.Client.NewSession()
-
 	return
 }
 
@@ -176,44 +188,42 @@ func (c *Connect) CreateSession() (session *ssh.Session, err error) {
 // TODO(blacknon): Interval及びMaxを設定できるようにする(v0.1.1)
 func (c *Connect) SendKeepAlive(session *ssh.Session) {
 	// keep alive interval (default 30 sec)
-	interval := 30
+	interval := 1
 	if c.SendKeepAliveInterval > 0 {
 		interval = c.SendKeepAliveInterval
 	}
 
-	// keep alive max (default 5)
-	max := 5
+	max := 3
 	if c.SendKeepAliveMax > 0 {
 		max = c.SendKeepAliveMax
 	}
 
-	// keep alive counter
-	i := 0
+	t := time.NewTicker(time.Duration(c.ConnectTimeout) * time.Second)
+	defer t.Stop()
+
+	count := 0
 	for {
-		// Send keep alive packet
-		_, err := session.SendRequest("keepalive", true, nil)
-		// _, _, err := c.Client.SendRequest("keepalive", true, nil)
-		if err == nil {
-			i = 0
-		} else {
-			i += 1
+		select {
+		case <-t.C:
+			if _, err := session.SendRequest("keepalive@openssh.com", true, nil); err != nil {
+				log.Println("Failed to send keepalive packet:", err)
+				count += 1
+			} else {
+				// err is nil.
+				time.Sleep(time.Duration(interval) * time.Second)
+			}
 		}
 
-		// check counter
-		if max <= i {
-			session.Close()
+		if count > max {
 			return
 		}
-
-		// sleep
-		time.Sleep(time.Duration(interval) * time.Second)
 	}
 }
 
 // CheckClientAlive check alive ssh.Client.
 func (c *Connect) CheckClientAlive() error {
 	_, _, err := c.Client.SendRequest("keepalive", true, nil)
-	if err == nil || err.Error() == "request failed" {
+	if err == nil {
 		return nil
 	}
 	return err
